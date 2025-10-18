@@ -73,7 +73,7 @@ class RedisManager {
         return $this->connected;
     }
     
-    public function addMessage($username, $message, $clientIp = null) {
+    public function addMessage($username, $message, $clientIp = null, $isPrivate = false) {
         if (!$this->connected) return false;
         
         if ($clientIp && !$this->checkIpFloodProtection($clientIp)) {
@@ -115,7 +115,8 @@ class RedisManager {
             'message' => $message,
             'timestamp' => $timestamp,
             'date' => date('Y-m-d H:i:s', $timestamp),
-            'ip' => $clientIp ? $this->hashIp($clientIp) : null
+            'ip' => $clientIp ? $this->hashIp($clientIp) : null,
+            'is_private' => $isPrivate
         ];
         
         $this->redis->zAdd(
@@ -131,7 +132,7 @@ class RedisManager {
         return $messageData;
     }
     
-    public function getMessages($limit = MAX_MESSAGES_DISPLAY, $afterTimestamp = null) {
+    public function getMessages($limit = MAX_MESSAGES_DISPLAY, $afterTimestamp = null, $sessionId = null) {
         if (!$this->connected) return [];
         
         $minTimestamp = time() - MESSAGE_TTL;
@@ -152,6 +153,10 @@ class RedisManager {
         foreach ($messages as $msg) {
             $decoded = json_decode($msg, true);
             if ($decoded) {
+                // Фильтруем приватные сообщения
+                if (!empty($decoded['is_private']) && $decoded['ip'] !== $this->hashIp($_SERVER['REMOTE_ADDR'] ?? '')) {
+                    continue;
+                }
                 unset($decoded['ip']);
                 $result[] = $decoded;
             }
@@ -460,135 +465,160 @@ class AIBot {
         $this->chat = $chat;
     }
     
-    public function shouldRespond($message) {
+    public function shouldRespond($message, $isPrivateMode = false) {
         if (!BOT_ENABLED || empty($this->apiKey)) {
             return false;
         }
         
+        // В приватном режиме бот отвечает всегда
+        if ($isPrivateMode) {
+            return true;
+        }
+        
+        // В общем чате бот отвечает только на триггер
         $trigger = mb_strtolower(BOT_TRIGGER);
         $messageLower = mb_strtolower($message);
         
         return mb_strpos($messageLower, $trigger) !== false;
     }
     
-    public function generateResponse($userMessage, $username) {
-    if (empty($this->apiKey)) {
-        return "🔑 API ключ не настроен!\n\n1. Получите ключ: https://openrouter.ai/keys\n2. Вставьте в define('OPENROUTER_API_KEY', 'ВАШ_КЛЮЧ');";
-    }
-    
-    try {
-        $context = $this->getRecentContext();
-        
-        $messages = [
-            [
-                'role' => 'system',
-                'content' => "Ты дружелюбный помощник в публичном чате. Твоё имя: " . BOT_NAME . ". Отвечай кратко (1-2 предложения максимум). Используй эмодзи. Общайся на русском языке. Будь веселым и позитивным!"
-            ]
-        ];
-        
-        // Добавляем только последние 3 сообщения для контекста
-        $recentContext = array_slice($context, -3);
-        
-        foreach ($recentContext as $msg) {
-            $role = ($msg['username'] === BOT_NAME) ? 'assistant' : 'user';
-            $messages[] = [
-                'role' => $role,
-                'content' => ($role === 'user' ? $msg['username'] . ': ' : '') . $msg['message']
-            ];
+    public function generateResponse($userMessage, $username, $isPrivateMode = false) {
+        if (empty($this->apiKey)) {
+            return "🔒 API ключ не настроен!\n\n1. Получите ключ: https://openrouter.ai/keys\n2. Вставьте в define('OPENROUTER_API_KEY', 'ВАШ_КЛЮЧ');";
         }
         
-        // Добавляем текущее сообщение
-        $messages[] = [
-            'role' => 'user',
-            'content' => $username . ': ' . $userMessage
-        ];
-        
-        $response = $this->callOpenRouter($messages);
-        
-        return $response;
-        
-    } catch (Exception $e) {
-        error_log("AI Bot error: " . $e->getMessage());
-        return "😅 " . $e->getMessage();
+        try {
+            $context = $this->getRecentContext($isPrivateMode);
+            
+            $systemPrompt = $isPrivateMode 
+                ? "Ты дружелюбный AI помощник в приватном чате с пользователем. Твоё имя: " . BOT_NAME . ". Отвечай развернуто и детально, помогай решать задачи. Общайся на русском языке."
+                : "Ты дружелюбный помощник в публичном чате. Твоё имя: " . BOT_NAME . ". Отвечай кратко (1-2 предложения максимум). Используй смодзи. Общайся на русском языке. Будь веселым и позитивным!";
+            
+            $messages = [
+                [
+                    'role' => 'system',
+                    'content' => $systemPrompt
+                ]
+            ];
+            
+            // В приватном режиме добавляем больше контекста
+            $contextLimit = $isPrivateMode ? 10 : 3;
+            $recentContext = array_slice($context, -$contextLimit);
+            
+            foreach ($recentContext as $msg) {
+                if ($isPrivateMode && $msg['username'] !== $username && $msg['username'] !== BOT_NAME) {
+                    continue; // В приватном режиме показываем только диалог с текущим пользователем
+                }
+                
+                $role = ($msg['username'] === BOT_NAME) ? 'assistant' : 'user';
+                $messages[] = [
+                    'role' => $role,
+                    'content' => ($role === 'user' ? $msg['username'] . ': ' : '') . $msg['message']
+                ];
+            }
+            
+            // Добавляем текущее сообщение
+            $messages[] = [
+                'role' => 'user',
+                'content' => $username . ': ' . $userMessage
+            ];
+            
+            $response = $this->callOpenRouter($messages, $isPrivateMode);
+            
+            return $response;
+            
+        } catch (Exception $e) {
+            error_log("AI Bot error: " . $e->getMessage());
+            return "😅 " . $e->getMessage();
+        }
     }
-}
     
-    private function getRecentContext() {
+    private function getRecentContext($isPrivateMode = false) {
         $messages = $this->chat->getMessages();
+        
+        if ($isPrivateMode) {
+            // В приватном режиме фильтруем только приватные сообщения
+            $messages = array_filter($messages, function($msg) {
+                return !empty($msg['is_private']);
+            });
+        }
+        
         $recent = array_slice($messages, -BOT_MAX_HISTORY);
         
         return $recent;
     }
     
-    private function callOpenRouter($messages) {
-    $url = 'https://openrouter.ai/api/v1/chat/completions';
-    
-    $data = [
-        'model' => $this->model,
-        'messages' => $messages,
-        'max_tokens' => 150,
-        'temperature' => 0.7,
-    ];
-    
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Content-Type: application/json',
-        'Authorization: Bearer ' . $this->apiKey,
-        'HTTP-Referer: https://github.com/guest-chat',
-        'X-Title: Guest Chat Bot'
-    ]);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-    
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    curl_close($ch);
-    
-    // Логируем для отладки
-    error_log("OpenRouter Response Code: $httpCode");
-    error_log("OpenRouter Response: " . substr($response, 0, 500));
-    
-    if ($curlError) {
-        error_log("CURL Error: " . $curlError);
-        throw new Exception("Ошибка соединения с AI сервисом");
-    }
-    
-    if ($httpCode !== 200) {
-        $result = json_decode($response, true);
-        $errorMsg = $result['error']['message'] ?? "HTTP $httpCode";
-        error_log("OpenRouter API Error: " . $errorMsg);
+    private function callOpenRouter($messages, $isPrivateMode = false) {
+        $url = 'https://openrouter.ai/api/v1/chat/completions';
         
-        // Дружественные сообщения об ошибках
-        if ($httpCode === 401) {
-            return "🔑 API ключ недействителен. Проверьте ключ на https://openrouter.ai/keys";
-        } elseif ($httpCode === 402) {
-            return "💳 Недостаточно кредитов. Пополните баланс на https://openrouter.ai/credits";
-        } elseif ($httpCode === 429) {
-            return "⏱️ Слишком много запросов. Попробуйте через минуту!";
-        } elseif ($httpCode === 503) {
-            return "🔧 Сервис временно недоступен. Попробуйте позже!";
-        } else {
-            return "❌ Ошибка AI сервиса ($errorMsg)";
+        $maxTokens = $isPrivateMode ? 500 : 150; // В приватном режиме разрешаем более длинные ответы
+        
+        $data = [
+            'model' => $this->model,
+            'messages' => $messages,
+            'max_tokens' => $maxTokens,
+            'temperature' => 0.7,
+        ];
+        
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $this->apiKey,
+            'HTTP-Referer: https://github.com/guest-chat',
+            'X-Title: Guest Chat Bot'
+        ]);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        // Логируем для отладки
+        error_log("OpenRouter Response Code: $httpCode");
+        error_log("OpenRouter Response: " . substr($response, 0, 500));
+        
+        if ($curlError) {
+            error_log("CURL Error: " . $curlError);
+            throw new Exception("Ошибка соединения с AI сервисом");
         }
+        
+        if ($httpCode !== 200) {
+            $result = json_decode($response, true);
+            $errorMsg = $result['error']['message'] ?? "HTTP $httpCode";
+            error_log("OpenRouter API Error: " . $errorMsg);
+            
+            // Дружественные сообщения об ошибках
+            if ($httpCode === 401) {
+                return "🔒 API ключ недействителен. Проверьте ключ на https://openrouter.ai/keys";
+            } elseif ($httpCode === 402) {
+                return "💳 Недостаточно кредитов. Пополните баланс на https://openrouter.ai/credits";
+            } elseif ($httpCode === 429) {
+                return "⏱️ Слишком много запросов. Попробуйте через минуту!";
+            } elseif ($httpCode === 503) {
+                return "🔧 Сервис временно недоступен. Попробуйте позже!";
+            } else {
+                return "❌ Ошибка AI сервиса ($errorMsg)";
+            }
+        }
+        
+        $result = json_decode($response, true);
+        
+        if (!isset($result['choices'][0]['message']['content'])) {
+            error_log("Invalid response structure: " . json_encode($result));
+            throw new Exception("Неверный формат ответа от AI");
+        }
+        
+        return trim($result['choices'][0]['message']['content']);
     }
     
-    $result = json_decode($response, true);
-    
-    if (!isset($result['choices'][0]['message']['content'])) {
-        error_log("Invalid response structure: " . json_encode($result));
-        throw new Exception("Неверный формат ответа от AI");
-    }
-    
-    return trim($result['choices'][0]['message']['content']);
-}
-    
-    public function sendBotMessage($message) {
+    public function sendBotMessage($message, $isPrivate = false) {
         $clientIp = $this->getClientIp();
-        return $this->redis->addMessage(BOT_NAME, $message, $clientIp);
+        return $this->redis->addMessage(BOT_NAME, $message, $clientIp, $isPrivate);
     }
     
     private function getClientIp() {
@@ -621,7 +651,7 @@ class ChatManager {
         $this->security = new SecurityManager();
     }
     
-    public function sendMessage($username, $message, $csrfToken) {
+    public function sendMessage($username, $message, $csrfToken, $chatMode = 'public') {
         if (!$this->security->verifyCsrfToken($csrfToken)) {
             return ['success' => false, 'error' => 'Неверный CSRF токен. Обновите страницу.'];
         }
@@ -654,8 +684,9 @@ class ChatManager {
         $message = $this->security->cleanMessage($message);
         
         $clientIp = $this->getClientIp();
+        $isPrivate = ($chatMode === 'bot');
         
-        $savedMessage = $this->redis->addMessage($username, $message, $clientIp);
+        $savedMessage = $this->redis->addMessage($username, $message, $clientIp, $isPrivate);
         
         if (is_array($savedMessage) && isset($savedMessage['error'])) {
             return ['success' => false, 'error' => $savedMessage['message']];
@@ -669,14 +700,14 @@ class ChatManager {
             if (BOT_ENABLED && !empty(OPENROUTER_API_KEY)) {
                 $bot = new AIBot($this->redis, $this);
                 
-                if ($bot->shouldRespond($message)) {
+                if ($bot->shouldRespond($message, $isPrivate)) {
                     try {
-                        $botReply = $bot->generateResponse($message, $username);
+                        $botReply = $bot->generateResponse($message, $username, $isPrivate);
                         
                         if (!empty($botReply)) {
                             usleep(500000); // 0.5 секунды задержка
                             
-                            $botMessage = $bot->sendBotMessage($botReply);
+                            $botMessage = $bot->sendBotMessage($botReply, $isPrivate);
                             $botResponse = $botMessage;
                         }
                     } catch (Exception $e) {
@@ -712,7 +743,8 @@ class ChatManager {
     }
     
     public function getMessages($afterTimestamp = null) {
-        $messages = $this->redis->getMessages(MAX_MESSAGES_DISPLAY, $afterTimestamp);
+        $sessionId = $this->security->getClientIdentifier();
+        $messages = $this->redis->getMessages(MAX_MESSAGES_DISPLAY, $afterTimestamp, $sessionId);
         
         foreach ($messages as &$msg) {
             $msg['username'] = $this->security->escape($msg['username']);
@@ -780,7 +812,8 @@ if (isset($_GET['api'])) {
             $result = $chat->sendMessage(
                 $data['username'] ?? '',
                 $data['message'] ?? '',
-                $data['csrf_token'] ?? ''
+                $data['csrf_token'] ?? '',
+                $data['chat_mode'] ?? 'public'
             );
             
             echo json_encode($result);
@@ -946,6 +979,46 @@ $stats = $chat->getStats();
             opacity: 0.5;
         }
 
+        /* Chat Mode Selector */
+        .chat-mode-selector {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 4px;
+            border-radius: 12px;
+        }
+
+        .mode-button {
+            flex: 1;
+            padding: 8px 16px;
+            background: transparent;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .mode-button:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .mode-button.active {
+            background: rgba(255, 255, 255, 0.25);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .mode-button .mode-icon {
+            font-size: 16px;
+        }
+
         .chat-info {
             display: flex;
             gap: 15px;
@@ -1014,6 +1087,14 @@ $stats = $chat->getStats();
             animation: slideIn 0.3s ease-out;
         }
 
+        .message.private {
+            background: linear-gradient(90deg, rgba(102, 126, 234, 0.05) 0%, transparent 100%);
+            padding: 10px;
+            border-radius: 10px;
+            margin-left: -10px;
+            margin-right: -10px;
+        }
+
         @keyframes slideIn {
             from {
                 opacity: 0;
@@ -1038,6 +1119,12 @@ $stats = $chat->getStats();
             font-size: 14px;
         }
 
+        .message.private .message-username::after {
+            content: ' 🔒';
+            font-size: 12px;
+            opacity: 0.7;
+        }
+
         .message-time {
             font-size: 12px;
             color: #999;
@@ -1053,9 +1140,27 @@ $stats = $chat->getStats();
             box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
         }
 
+        .message.private .message-content {
+            border-left-color: #9333ea;
+        }
+
         .message-content a {
             color: #667eea;
             text-decoration: underline;
+        }
+
+        /* Bot Mode Indicator */
+        .bot-mode-indicator {
+            background: linear-gradient(135deg, #9333ea 0%, #667eea 100%);
+            color: white;
+            padding: 10px;
+            text-align: center;
+            font-size: 14px;
+            display: none;
+        }
+
+        .bot-mode-indicator.active {
+            display: block;
         }
 
         .chat-input-container {
@@ -1104,6 +1209,10 @@ $stats = $chat->getStats();
             border-color: #667eea;
         }
 
+        #messageInput.bot-mode {
+            border-color: #9333ea;
+        }
+
         #messageInput.warning {
             border-color: #f59e0b;
         }
@@ -1133,6 +1242,10 @@ $stats = $chat->getStats();
             justify-content: center;
             transition: transform 0.2s, box-shadow 0.2s;
             font-size: 20px;
+        }
+
+        .send-button.bot-mode {
+            background: linear-gradient(135deg, #9333ea 0%, #667eea 100%);
         }
 
         .emoji-button:hover, .send-button:hover {
@@ -1345,6 +1458,19 @@ $stats = $chat->getStats();
                     <span id="onlineCount"><?php echo $stats['online']; ?></span> онлайн
                 </div>
             </div>
+            
+            <!-- Селектор режима чата -->
+            <div class="chat-mode-selector">
+                <button class="mode-button active" id="publicModeBtn" data-mode="public">
+                    <span class="mode-icon">👥</span>
+                    <span>Общий чат</span>
+                </button>
+                <button class="mode-button" id="botModeBtn" data-mode="bot">
+                    <span class="mode-icon">🤖</span>
+                    <span>Чат с ботом</span>
+                </button>
+            </div>
+            
             <div class="chat-info">
                 <div class="info-item">
                     📝 <span id="messageCount"><?php echo $stats['messages']; ?></span> / <?php echo number_format(MAX_MESSAGES_TOTAL); ?>
@@ -1355,15 +1481,17 @@ $stats = $chat->getStats();
                 <div class="info-item">
                     💾 RAM: <span id="memoryUsage"><?php echo $stats['memory_mb']; ?></span>MB
                 </div>
-                <?php if (BOT_ENABLED && !empty(OPENROUTER_API_KEY)): ?>
-                <div class="info-item">
-                    🤖 Бот активен (напишите <?php echo BOT_TRIGGER; ?>)
+                <div class="info-item" id="botStatusInfo">
+                    🤖 Бот активен
                 </div>
-                <?php endif; ?>
                 <div class="info-item">
                     🔒 XSS · CSRF · Rate Limit · IP Flood
                 </div>
             </div>
+        </div>
+        
+        <div class="bot-mode-indicator" id="botModeIndicator">
+            🤖 Приватный режим: вы общаетесь с AI ассистентом
         </div>
         
         <div class="chat-messages" id="chatMessages">
@@ -1401,7 +1529,7 @@ $stats = $chat->getStats();
             <div class="input-group">
                 <textarea 
                     id="messageInput" 
-                    placeholder="Напишите сообщение... (для вызова бота: <?php echo BOT_TRIGGER; ?>)" 
+                    placeholder="Напишите сообщение..." 
                     maxlength="<?php echo MAX_MESSAGE_LENGTH; ?>"
                     rows="1"
                 ></textarea>
@@ -1429,15 +1557,16 @@ $stats = $chat->getStats();
         const CHECK_INTERVAL = 7000;
         const STATS_UPDATE_INTERVAL = 15000;
         const BOT_TRIGGER = '<?php echo BOT_TRIGGER; ?>';
+        const BOT_ENABLED = <?php echo BOT_ENABLED ? 'true' : 'false'; ?>;
 
         const EMOJI_DATA = {
             smileys: ['😀', '😃', '😄', '😁', '😆', '😅', '🤣', '😂', '🙂', '🙃', '😉', '😊', '😇', '🥰', '😍', '🤩', '😘', '😗', '😚', '😙', '😋', '😛', '😜', '🤪', '😝', '🤑', '🤗', '🤭', '🤫', '🤔', '🤐', '🤨', '😐', '😑', '😶', '😏', '😒', '🙄', '😬', '🤥', '😌', '😔', '😪', '🤤', '😴', '😷', '🤒', '🤕', '🤢', '🤮', '🤧', '🥵', '🥶', '😎', '🤓', '🧐', '😕', '😟', '🙁', '☹️', '😮', '😯', '😲', '😳', '🥺', '😦', '😧', '😨', '😰', '😥', '😢', '😭', '😱', '😖', '😣', '😞', '😓', '😩', '😫', '🥱', '😤', '😡', '😠', '🤬'],
-            gestures: ['👋', '🤚', '🖐️', '✋', '🖖', '👌', '🤏', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', '👉', '👆', '👇', '☝️', '👍', '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '👐', '🤲', '🤝', '🙏'],
+            gestures: ['👋', '🤚', '🖐️', '✋', '🖖', '👌', '🤌', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', '👉', '👆', '👇', '☝️', '👍', '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '👐', '🤲', '🤝', '🙏'],
             animals: ['🐶', '🐱', '🐭', '🐹', '🐰', '🦊', '🐻', '🐼', '🐨', '🐯', '🦁', '🐮', '🐷', '🐸', '🐵', '🐔', '🐧', '🐦', '🐤', '🦆', '🦅', '🦉', '🦇', '🐺', '🐗', '🐴', '🦄', '🐝', '🐛', '🦋', '🐌', '🐞', '🐜', '🦗', '🕷️', '🦂', '🐢', '🐍', '🦎', '🦖', '🦕', '🐙', '🦑', '🦐', '🦀', '🐡', '🐠', '🐟', '🐬', '🐳', '🐋', '🦈', '🐊', '🐅', '🐆', '🦓', '🦍', '🦧', '🐘', '🦛', '🦏', '🐪', '🐫', '🦒', '🦘', '🐃', '🐂', '🐄', '🐎', '🐖', '🐏', '🐑', '🦙', '🐐', '🦌', '🐕', '🐩', '🦮', '🐈', '🐓', '🦃', '🦚', '🦜', '🦢', '🦩', '🕊️', '🐇', '🦝', '🦨', '🦡', '🦦', '🦥'],
-            food: ['🍎', '🍏', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇', '🍓', '🍈', '🍒', '🍑', '🥭', '🍍', '🥥', '🥝', '🍅', '🍆', '🥑', '🥦', '🥬', '🥒', '🌶️', '🌽', '🥕', '🧄', '🧅', '🥔', '🍠', '🥐', '🥯', '🍞', '🥖', '🥨', '🧀', '🥚', '🍳', '🧈', '🥞', '🧇', '🥓', '🥩', '🍗', '🍖', '🌭', '🍔', '🍟', '🍕', '🥪', '🥙', '🧆', '🌮', '🌯', '🥗', '🥘', '🥫', '🍝', '🍜', '🍲', '🍛', '🍣', '🍱', '🥟', '🦪', '🍤', '🍙', '🍚', '🍘', '🍥', '🥠', '🥮', '🍢', '🍡', '🍧', '🍨', '🍦', '🥧', '🧁', '🍰', '🎂', '🍮', '🍭', '🍬', '🍫', '🍿', '🍩', '🍪', '🌰', '🥜', '🍯', '🥛', '🍼', '☕', '🍵', '🧃', '🥤', '🍶', '🍺', '🍻', '🥂', '🍷', '🥃', '🍸', '🍹', '🧉', '🍾'],
-            activities: ['⚽', '🏀', '🏈', '⚾', '🥎', '🎾', '🏐', '🏉', '🥏', '🎱', '🏓', '🏸', '🏒', '🏑', '🥍', '🏏', '🥅', '⛳', '🏹', '🎣', '🥊', '🥋', '🎽', '🛹', '🛷', '⛸️', '🥌', '🎿', '⛷️', '🏂', '🏋️', '🤼', '🤸', '🤺', '⛹️', '🤾', '🏌️', '🏇', '🧘', '🏊', '🏄', '🚣', '🧗', '🚵', '🚴', '🏆', '🥇', '🥈', '🥉', '🏅', '🎖️', '🎗️', '🎫', '🎟️', '🎪', '🎭', '🎨', '🎬', '🎤', '🎧', '🎼', '🎹', '🥁', '🎷', '🎺', '🎸', '🎻', '🎲', '🎯', '🎳', '🎮', '🎰'],
+            food: ['🍎', '🍏', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇', '🍓', '🫐', '🍈', '🍒', '🍑', '🥭', '🍍', '🥥', '🥝', '🍅', '🍆', '🥑', '🥦', '🥬', '🥒', '🌶️', '🌽', '🥕', '🧄', '🧅', '🥔', '🍠', '🥐', '🥯', '🍞', '🥖', '🥨', '🧀', '🥚', '🍳', '🧈', '🥞', '🧇', '🥓', '🥩', '🍗', '🍖', '🌭', '🍔', '🍟', '🍕', '🥪', '🥙', '🧆', '🌮', '🌯', '🥗', '🥘', '🥫', '🍝', '🍜', '🍲', '🍛', '🍣', '🍱', '🥟', '🦪', '🍤', '🍙', '🍚', '🍘', '🍥', '🥠', '🥮', '🍢', '🍡', '🍧', '🍨', '🍦', '🥧', '🧁', '🍰', '🎂', '🍮', '🍭', '🍬', '🍫', '🍿', '🍩', '🍪', '🌰', '🥜', '🍯', '🥛', '🍼', '☕', '🍵', '🧃', '🥤', '🍶', '🍺', '🍻', '🥂', '🍷', '🥃', '🍸', '🍹', '🧉', '🍾'],
+            activities: ['⚽', '🏀', '🏈', '⚾', '🥎', '🎾', '🏐', '🏉', '🥏', '🎱', '🏓', '🏸', '🏑', '🏒', '🥍', '🏏', '🥅', '⛳', '🏹', '🎣', '🥊', '🥋', '🎽', '🛹', '🛷', '⛸️', '🥌', '🎿', '⛷️', '🏂', '🏋️', '🤼', '🤸', '🤺', '⛹️', '🤾', '🏌️', '🏇', '🧘', '🏊', '🏄', '🚣', '🧗', '🚵', '🚴', '🏆', '🥇', '🥈', '🥉', '🏅', '🎖️', '🏵️', '🎗️', '🎫', '🎟️', '🎪', '🎭', '🎨', '🎬', '🎤', '🎧', '🎼', '🎹', '🥁', '🎷', '🎺', '🎸', '🎻', '🎲', '🎯', '🎳', '🎮', '🎰'],
             objects: ['⌚', '📱', '📲', '💻', '⌨️', '🖥️', '🖨️', '🖱️', '🖲️', '🕹️', '🗜️', '💾', '💿', '📀', '📼', '📷', '📸', '📹', '🎥', '📽️', '🎞️', '📞', '☎️', '📟', '📠', '📺', '📻', '🎙️', '🎚️', '🎛️', '🧭', '⏱️', '⏲️', '⏰', '🕰️', '⌛', '⏳', '📡', '🔋', '🔌', '💡', '🔦', '🕯️', '🧯', '🛢️', '💸', '💵', '💴', '💶', '💷', '💰', '💳', '💎', '⚖️', '🧰', '🔧', '🔨', '⚒️', '🛠️', '⛏️', '🔩', '⚙️', '🧱', '⛓️', '🧲', '🔫', '💣', '🧨', '🔪', '🗡️', '⚔️', '🛡️', '🚬', '⚰️', '⚱️', '🏺', '🔮', '📿', '🧿', '💈', '⚗️', '🔭', '🔬', '🕳️', '💊', '💉', '🩸', '🩹', '🩺', '🌡️', '🧬', '🦠', '🧫', '🧪'],
-            symbols: ['❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '☮️', '✝️', '☪️', '🕉️', '☸️', '✡️', '🔯', '🕎', '☯️', '☦️', '🛐', '⛎', '♈', '♉', '♊', '♋', '♌', '♍', '♎', '♏', '♐', '♑', '♒', '♓', '🆔', '⚛️', '☢️', '☣️', '📴', '📳', '🈶', '🈚', '🈸', '🈺', '🈷️', '✴️', '🆚', '💮', '🉐', '㊙️', '㊗️', '🈴', '🈵', '🈹', '🈲', '🅰️', '🅱️', '🆎', '🆑', '🅾️', '🆘', '❌', '⭕', '🛑', '⛔', '📛', '🚫', '💯', '💢', '♨️', '🚷', '🚯', '🚳', '🚱', '🔞', '📵', '🚭', '❗', '❕', '❓', '❔', '‼️', '⁉️', '🔅', '🔆', '〽️', '⚠️', '🚸', '🔱', '⚜️', '🔰', '♻️', '✅', '🈯', '💹', '❇️', '✳️', '❎', '🌐', '💠', '🌀', '💤', '🏧', '🚾', '♿', '🅿️', '🈳', '🈂️', '🛂', '🛃', '🛄', '🛅', '🚹', '🚺', '🚼', '🚻', '🚮', '🎦', '📶', '🈁', '🔣', 'ℹ️', '🔤', '🔡', '🔠', '🆖', '🆗', '🆙', '🆒', '🆕', '🆓']
+            symbols: ['❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '☮️', '✝️', '☪️', '🕉️', '☸️', '✡️', '🔯', '🕎', '☯️', '☦️', '🛐', '⛎', '♈', '♉', '♊', '♋', '♌', '♍', '♎', '♏', '♐', '♑', '♒', '♓', '🆔', '⚛️', '☢️', '☣️', '🔴', '🔵', '🈶', '🈚', '🈸', '🈺', '🈷️', '✴️', '🆚', '💮', '🉐', '㊙️', '㊗️', '🈴', '🈵', '🈹', '🈲', '🅰️', '🅱️', '🆎', '🆑', '🅾️', '🆘', '❌', '⭕', '🛑', '⛔', '📛', '🚫', '💯', '💢', '♨️', '🚷', '🚯', '🚳', '🚱', '🔞', '📵', '🚭', '❗', '❕', '❓', '❔', '‼️', '⁉️', '🔅', '🔆', '〽️', '⚠️', '🚸', '🔱', '⚜️', '🔰', '♻️', '✅', '🈯', '💹', '❇️', '✳️', '❎', '🌐', '💠', '🌀', '💤', '🏧', '🚾', '♿', '🅿️', '🈳', '🈂️', '🛂', '🛃', '🛄', '🛅', '🚹', '🚺', '🚼', '🚻', '🚮', '🎦', '📶', '🈁', '🔣', 'ℹ️', '🔤', '🔡', '🔠', '🆖', '🆗', '🆙', '🆒', '🆕', '🆓']
         };
 
         class GuestChat {
@@ -1451,6 +1580,7 @@ $stats = $chat->getStats();
                 this.soundEnabled = localStorage.getItem('chat_sound_enabled') !== 'false';
                 this.audioContext = null;
                 this.myLastMessageId = null;
+                this.chatMode = 'public'; // 'public' или 'bot'
                 
                 this.initElements();
                 this.initAudio();
@@ -1482,6 +1612,12 @@ $stats = $chat->getStats();
                 this.emojiClose = document.getElementById('emojiClose');
                 this.emojiGrid = document.getElementById('emojiGrid');
                 this.soundToggle = document.getElementById('soundToggle');
+                
+                // Элементы для режима чата
+                this.publicModeBtn = document.getElementById('publicModeBtn');
+                this.botModeBtn = document.getElementById('botModeBtn');
+                this.botModeIndicator = document.getElementById('botModeIndicator');
+                this.botStatusInfo = document.getElementById('botStatusInfo');
             }
             
             initAudio() {
@@ -1537,6 +1673,32 @@ $stats = $chat->getStats();
                 }
             }
             
+            setChatMode(mode) {
+                this.chatMode = mode;
+                
+                // Обновляем UI
+                if (mode === 'bot') {
+                    this.publicModeBtn.classList.remove('active');
+                    this.botModeBtn.classList.add('active');
+                    this.botModeIndicator.classList.add('active');
+                    this.messageInput.classList.add('bot-mode');
+                    this.sendButton.classList.add('bot-mode');
+                    this.messageInput.placeholder = 'Напишите сообщение боту...';
+                    this.botStatusInfo.innerHTML = '🤖 Приватный чат с ботом';
+                } else {
+                    this.publicModeBtn.classList.add('active');
+                    this.botModeBtn.classList.remove('active');
+                    this.botModeIndicator.classList.remove('active');
+                    this.messageInput.classList.remove('bot-mode');
+                    this.sendButton.classList.remove('bot-mode');
+                    this.messageInput.placeholder = 'Напишите сообщение... (для вызова бота: ' + BOT_TRIGGER + ')';
+                    this.botStatusInfo.innerHTML = '🤖 Бот активен (напишите ' + BOT_TRIGGER + ')';
+                }
+                
+                // Перезагружаем сообщения
+                this.loadMessages();
+            }
+            
             attachEvents() {
                 this.sendButton.addEventListener('click', () => this.sendMessage());
                 
@@ -1559,6 +1721,10 @@ $stats = $chat->getStats();
                 this.emojiButton.addEventListener('click', () => this.toggleEmojiPicker());
                 this.emojiClose.addEventListener('click', () => this.hideEmojiPicker());
                 this.soundToggle.addEventListener('click', () => this.toggleSound());
+                
+                // События переключения режима чата
+                this.publicModeBtn.addEventListener('click', () => this.setChatMode('public'));
+                this.botModeBtn.addEventListener('click', () => this.setChatMode('bot'));
                 
                 document.addEventListener('click', (e) => {
                     if (!this.emojiPicker.contains(e.target) && e.target !== this.emojiButton) {
@@ -1652,7 +1818,8 @@ $stats = $chat->getStats();
                 this.sendButton.disabled = true;
                 this.hideEmojiPicker();
                 
-                const triggerFound = message.toLowerCase().includes(BOT_TRIGGER.toLowerCase());
+                // В режиме бота всегда срабатывает триггер
+                const triggerFound = this.chatMode === 'bot' || message.toLowerCase().includes(BOT_TRIGGER.toLowerCase());
                 let typingIndicator = null;
                 
                 try {
@@ -1664,7 +1831,8 @@ $stats = $chat->getStats();
                         body: JSON.stringify({
                             username: username,
                             message: message,
-                            csrf_token: this.csrfToken
+                            csrf_token: this.csrfToken,
+                            chat_mode: this.chatMode
                         })
                     });
                     
@@ -1831,6 +1999,9 @@ $stats = $chat->getStats();
             createMessageElement(msg) {
                 const div = document.createElement('div');
                 div.className = 'message';
+                if (msg.is_private) {
+                    div.className += ' private';
+                }
                 div.dataset.id = msg.id;
                 
                 const time = new Date(msg.date).toLocaleTimeString('ru-RU', {
