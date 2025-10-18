@@ -1,7 +1,7 @@
 <?php
 // ============================================================================
-// ГОСТЕВОЙ ЧАТ НА PHP + REDIS
-// С умной проверкой новых сообщений и смайликами 😊
+// ГОСТЕВОЙ ЧАТ НА PHP + REDIS + AI БОТ
+// С умной проверкой новых сообщений, смайликами, звуком и AI помощником
 // ============================================================================
 
 session_start();
@@ -29,9 +29,17 @@ define('CLEANUP_INTERVAL', 3600);         // Интервал очистки (1 
 define('MAX_MESSAGES_TOTAL', 10000);      // Максимум сообщений в Redis
 define('MAX_MESSAGES_SOFT_LIMIT', 8000);  // Мягкий лимит (начало очистки)
 define('CLEANUP_BATCH_SIZE', 1000);       // Удалять по 1000 старых сообщений
-define('MAX_REDIS_MEMORY_MB', 10);       // Максимум памяти Redis (МБ)
+define('MAX_REDIS_MEMORY_MB', 100);       // Максимум памяти Redis (МБ)
 define('FLOOD_PROTECTION_WINDOW', 60);    // Окно антифлуда (секунд)
 define('MAX_MESSAGES_PER_IP', 10);        // Макс сообщений с одного IP в окне
+
+// === AI БОТ (OpenRouter) ===
+define('OPENROUTER_API_KEY', 'sk-or-v1-');         // Получите на https://openrouter.ai/keys
+define('BOT_ENABLED', true);              // Включить/выключить бота
+define('BOT_NAME', '🤖 Ассистент');      // Имя бота
+define('BOT_MODEL', 'qwen/qwen-2.5-72b-instruct:free'); // Бесплатная модель
+define('BOT_TRIGGER', '@бот');           // Триггер для вызова бота
+define('BOT_MAX_HISTORY', 5);            // Сколько предыдущих сообщений учитывать
 
 date_default_timezone_set('Europe/Moscow');
 
@@ -52,7 +60,6 @@ class RedisManager {
                 $this->redis->auth(REDIS_PASSWORD);
             }
             
-            // Запускаем очистку при инициализации
             $this->cleanupOldMessages();
             $this->enforceMessageLimit();
             
@@ -66,13 +73,9 @@ class RedisManager {
         return $this->connected;
     }
     
-    /**
-     * Добавление сообщения с проверкой лимитов
-     */
     public function addMessage($username, $message, $clientIp = null) {
         if (!$this->connected) return false;
         
-        // 1. Проверка флуда по IP
         if ($clientIp && !$this->checkIpFloodProtection($clientIp)) {
             return [
                 'error' => 'flood',
@@ -80,13 +83,10 @@ class RedisManager {
             ];
         }
         
-        // 2. Проверка общего количества сообщений
         $currentCount = $this->getMessageCount();
         if ($currentCount >= MAX_MESSAGES_TOTAL) {
-            // Экстренная очистка
             $this->emergencyCleanup();
             
-            // Проверяем снова
             $currentCount = $this->getMessageCount();
             if ($currentCount >= MAX_MESSAGES_TOTAL) {
                 return [
@@ -96,7 +96,6 @@ class RedisManager {
             }
         }
         
-        // 3. Проверка использования памяти Redis
         if (!$this->checkMemoryUsage()) {
             $this->emergencyCleanup();
             return [
@@ -105,12 +104,10 @@ class RedisManager {
             ];
         }
         
-        // 4. Мягкий лимит - начинаем постепенную очистку
         if ($currentCount >= MAX_MESSAGES_SOFT_LIMIT) {
             $this->softCleanup();
         }
         
-        // 5. Создаём и сохраняем сообщение
         $timestamp = time();
         $messageData = [
             'id' => uniqid('msg_', true),
@@ -121,14 +118,12 @@ class RedisManager {
             'ip' => $clientIp ? $this->hashIp($clientIp) : null
         ];
         
-        // Используем sorted set для эффективного управления по времени
         $this->redis->zAdd(
             'chat:messages:sorted',
             $timestamp,
             json_encode($messageData)
         );
         
-        // Записываем IP для антифлуд защиты
         if ($clientIp) {
             $this->trackIpMessage($clientIp);
         }
@@ -136,26 +131,20 @@ class RedisManager {
         return $messageData;
     }
     
-    /**
-     * Получение сообщений (все или только новые)
-     */
     public function getMessages($limit = MAX_MESSAGES_DISPLAY, $afterTimestamp = null) {
         if (!$this->connected) return [];
         
-        // Удаляем устаревшие сообщения при каждом запросе
         $minTimestamp = time() - MESSAGE_TTL;
         $this->redis->zRemRangeByScore('chat:messages:sorted', 0, $minTimestamp);
         
-        // Если указан timestamp, получаем только сообщения новее него
         if ($afterTimestamp !== null) {
             $messages = $this->redis->zRangeByScore(
                 'chat:messages:sorted',
-                $afterTimestamp + 1, // Строго больше
+                $afterTimestamp + 1,
                 '+inf',
                 ['limit' => [0, $limit]]
             );
         } else {
-            // Получаем последние N сообщений
             $messages = $this->redis->zRevRange('chat:messages:sorted', 0, $limit - 1);
         }
         
@@ -163,20 +152,14 @@ class RedisManager {
         foreach ($messages as $msg) {
             $decoded = json_decode($msg, true);
             if ($decoded) {
-                // Убираем IP из публичного вывода
                 unset($decoded['ip']);
                 $result[] = $decoded;
             }
         }
         
-        // Если не получали новые, результат уже в правильном порядке
-        // Если получали все - разворачиваем
         return $afterTimestamp === null ? array_reverse($result) : $result;
     }
     
-    /**
-     * Получить timestamp последнего сообщения
-     */
     public function getLastMessageTimestamp() {
         if (!$this->connected) return 0;
         
@@ -189,9 +172,6 @@ class RedisManager {
         return (int) array_values($messages)[0];
     }
     
-    /**
-     * Периодическая очистка старых сообщений
-     */
     private function cleanupOldMessages() {
         if (!$this->connected) return;
         
@@ -211,25 +191,18 @@ class RedisManager {
         }
     }
     
-    /**
-     * Принудительное ограничение количества сообщений
-     */
     private function enforceMessageLimit() {
         if (!$this->connected) return;
         
         $count = $this->getMessageCount();
         
         if ($count > MAX_MESSAGES_TOTAL) {
-            // Удаляем самые старые сообщения, оставляя только MAX_MESSAGES_TOTAL
             $toRemove = $count - MAX_MESSAGES_TOTAL;
             $this->redis->zRemRangeByRank('chat:messages:sorted', 0, $toRemove - 1);
             error_log("Enforced message limit: removed {$toRemove} messages");
         }
     }
     
-    /**
-     * Мягкая очистка - удаляет часть старых сообщений
-     */
     private function softCleanup() {
         if (!$this->connected) return;
         
@@ -242,9 +215,6 @@ class RedisManager {
         }
     }
     
-    /**
-     * Экстренная очистка - удаляет большое количество старых сообщений
-     */
     private function emergencyCleanup() {
         if (!$this->connected) return;
         
@@ -257,9 +227,6 @@ class RedisManager {
         }
     }
     
-    /**
-     * Проверка использования памяти Redis
-     */
     private function checkMemoryUsage() {
         if (!$this->connected) return true;
         
@@ -282,9 +249,6 @@ class RedisManager {
         }
     }
     
-    /**
-     * Защита от флуда по IP
-     */
     private function checkIpFloodProtection($ip) {
         if (!$this->connected) return true;
         
@@ -298,9 +262,6 @@ class RedisManager {
         return true;
     }
     
-    /**
-     * Запись сообщения от IP
-     */
     private function trackIpMessage($ip) {
         if (!$this->connected) return;
         
@@ -309,24 +270,15 @@ class RedisManager {
         $this->redis->expire($key, FLOOD_PROTECTION_WINDOW);
     }
     
-    /**
-     * Хеширование IP для конфиденциальности
-     */
     private function hashIp($ip) {
         return hash('sha256', $ip . 'chat_salt_' . date('Y-m-d'));
     }
     
-    /**
-     * Получить количество сообщений
-     */
     public function getMessageCount() {
         if (!$this->connected) return 0;
         return $this->redis->zCard('chat:messages:sorted');
     }
     
-    /**
-     * Проверка rate limit
-     */
     public function checkRateLimit($identifier) {
         if (!$this->connected) return ['allowed' => true];
         
@@ -344,9 +296,6 @@ class RedisManager {
         return ['allowed' => true];
     }
     
-    /**
-     * Получить количество онлайн пользователей
-     */
     public function getOnlineCount() {
         if (!$this->connected) return 0;
         
@@ -356,9 +305,6 @@ class RedisManager {
         return $this->redis->zCard($key);
     }
     
-    /**
-     * Обновить статус онлайн
-     */
     public function updateOnlineStatus($sessionId) {
         if (!$this->connected) return;
         
@@ -367,9 +313,6 @@ class RedisManager {
         $this->redis->expire($key, 600);
     }
     
-    /**
-     * Получить статистику Redis
-     */
     public function getRedisStats() {
         if (!$this->connected) {
             return [
@@ -409,13 +352,8 @@ class SecurityManager {
     }
     
     public function cleanMessage($message) {
-        // Удаляем HTML теги
         $message = strip_tags($message);
-        
-        // Удаляем управляющие символы
         $message = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', $message);
-        
-        // Нормализуем пробелы
         $message = trim($message);
         $message = preg_replace('/\s+/', ' ', $message);
         
@@ -489,7 +427,6 @@ class SecurityManager {
             return ['valid' => false, 'error' => 'Сообщение слишком длинное (максимум ' . MAX_MESSAGE_LENGTH . ' символов)'];
         }
         
-        // Проверка на спам (повторяющиеся символы)
         if (preg_match('/(.)\1{20,}/', $message)) {
             return ['valid' => false, 'error' => 'Сообщение содержит слишком много повторяющихся символов'];
         }
@@ -507,6 +444,171 @@ class SecurityManager {
 }
 
 // ============================================================================
+// КЛАСС: AI BOT (OpenRouter)
+// ============================================================================
+
+class AIBot {
+    private $apiKey;
+    private $model;
+    private $redis;
+    private $chat;
+    
+    public function __construct($redis, $chat) {
+        $this->apiKey = OPENROUTER_API_KEY;
+        $this->model = BOT_MODEL;
+        $this->redis = $redis;
+        $this->chat = $chat;
+    }
+    
+    public function shouldRespond($message) {
+        if (!BOT_ENABLED || empty($this->apiKey)) {
+            return false;
+        }
+        
+        $trigger = mb_strtolower(BOT_TRIGGER);
+        $messageLower = mb_strtolower($message);
+        
+        return mb_strpos($messageLower, $trigger) !== false;
+    }
+    
+    public function generateResponse($userMessage, $username) {
+    if (empty($this->apiKey)) {
+        return "🔑 API ключ не настроен!\n\n1. Получите ключ: https://openrouter.ai/keys\n2. Вставьте в define('OPENROUTER_API_KEY', 'ВАШ_КЛЮЧ');";
+    }
+    
+    try {
+        $context = $this->getRecentContext();
+        
+        $messages = [
+            [
+                'role' => 'system',
+                'content' => "Ты дружелюбный помощник в публичном чате. Твоё имя: " . BOT_NAME . ". Отвечай кратко (1-2 предложения максимум). Используй эмодзи. Общайся на русском языке. Будь веселым и позитивным!"
+            ]
+        ];
+        
+        // Добавляем только последние 3 сообщения для контекста
+        $recentContext = array_slice($context, -3);
+        
+        foreach ($recentContext as $msg) {
+            $role = ($msg['username'] === BOT_NAME) ? 'assistant' : 'user';
+            $messages[] = [
+                'role' => $role,
+                'content' => ($role === 'user' ? $msg['username'] . ': ' : '') . $msg['message']
+            ];
+        }
+        
+        // Добавляем текущее сообщение
+        $messages[] = [
+            'role' => 'user',
+            'content' => $username . ': ' . $userMessage
+        ];
+        
+        $response = $this->callOpenRouter($messages);
+        
+        return $response;
+        
+    } catch (Exception $e) {
+        error_log("AI Bot error: " . $e->getMessage());
+        return "😅 " . $e->getMessage();
+    }
+}
+    
+    private function getRecentContext() {
+        $messages = $this->chat->getMessages();
+        $recent = array_slice($messages, -BOT_MAX_HISTORY);
+        
+        return $recent;
+    }
+    
+    private function callOpenRouter($messages) {
+    $url = 'https://openrouter.ai/api/v1/chat/completions';
+    
+    $data = [
+        'model' => $this->model,
+        'messages' => $messages,
+        'max_tokens' => 150,
+        'temperature' => 0.7,
+    ];
+    
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $this->apiKey,
+        'HTTP-Referer: https://github.com/guest-chat',
+        'X-Title: Guest Chat Bot'
+    ]);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    
+    // Логируем для отладки
+    error_log("OpenRouter Response Code: $httpCode");
+    error_log("OpenRouter Response: " . substr($response, 0, 500));
+    
+    if ($curlError) {
+        error_log("CURL Error: " . $curlError);
+        throw new Exception("Ошибка соединения с AI сервисом");
+    }
+    
+    if ($httpCode !== 200) {
+        $result = json_decode($response, true);
+        $errorMsg = $result['error']['message'] ?? "HTTP $httpCode";
+        error_log("OpenRouter API Error: " . $errorMsg);
+        
+        // Дружественные сообщения об ошибках
+        if ($httpCode === 401) {
+            return "🔑 API ключ недействителен. Проверьте ключ на https://openrouter.ai/keys";
+        } elseif ($httpCode === 402) {
+            return "💳 Недостаточно кредитов. Пополните баланс на https://openrouter.ai/credits";
+        } elseif ($httpCode === 429) {
+            return "⏱️ Слишком много запросов. Попробуйте через минуту!";
+        } elseif ($httpCode === 503) {
+            return "🔧 Сервис временно недоступен. Попробуйте позже!";
+        } else {
+            return "❌ Ошибка AI сервиса ($errorMsg)";
+        }
+    }
+    
+    $result = json_decode($response, true);
+    
+    if (!isset($result['choices'][0]['message']['content'])) {
+        error_log("Invalid response structure: " . json_encode($result));
+        throw new Exception("Неверный формат ответа от AI");
+    }
+    
+    return trim($result['choices'][0]['message']['content']);
+}
+    
+    public function sendBotMessage($message) {
+        $clientIp = $this->getClientIp();
+        return $this->redis->addMessage(BOT_NAME, $message, $clientIp);
+    }
+    
+    private function getClientIp() {
+        $ip = '';
+        
+        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+            $ip = $_SERVER['HTTP_CF_CONNECTING_IP'];
+        } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+            $ip = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0];
+        } elseif (!empty($_SERVER['HTTP_X_REAL_IP'])) {
+            $ip = $_SERVER['HTTP_X_REAL_IP'];
+        } else {
+            $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+        }
+        
+        return filter_var(trim($ip), FILTER_VALIDATE_IP) ? $ip : '';
+    }
+}
+
+// ============================================================================
 // КЛАСС: CHAT MANAGER
 // ============================================================================
 
@@ -520,26 +622,22 @@ class ChatManager {
     }
     
     public function sendMessage($username, $message, $csrfToken) {
-        // Проверка CSRF
         if (!$this->security->verifyCsrfToken($csrfToken)) {
             return ['success' => false, 'error' => 'Неверный CSRF токен. Обновите страницу.'];
         }
         
-        // Валидация имени
         $usernameValidation = $this->security->validateUsername($username);
         if (!$usernameValidation['valid']) {
             return ['success' => false, 'error' => $usernameValidation['error']];
         }
         $username = $usernameValidation['username'];
         
-        // Валидация сообщения
         $messageValidation = $this->security->validateMessage($message);
         if (!$messageValidation['valid']) {
             return ['success' => false, 'error' => $messageValidation['error']];
         }
         $message = $messageValidation['message'];
         
-        // Проверка rate limit
         $clientId = $this->security->getClientIdentifier();
         $rateLimitCheck = $this->redis->checkRateLimit($clientId);
         
@@ -552,48 +650,59 @@ class ChatManager {
             ];
         }
         
-        // Очистка от XSS
         $username = $this->security->cleanMessage($username);
         $message = $this->security->cleanMessage($message);
         
-        // Получаем IP пользователя
         $clientIp = $this->getClientIp();
         
-        // Сохранение сообщения (с проверкой лимитов внутри)
         $savedMessage = $this->redis->addMessage($username, $message, $clientIp);
         
-        // Проверяем на ошибки переполнения
         if (is_array($savedMessage) && isset($savedMessage['error'])) {
             return ['success' => false, 'error' => $savedMessage['message']];
         }
         
         if ($savedMessage) {
-            // Обновляем статус онлайн
             $this->redis->updateOnlineStatus($clientId);
+            
+            // === AI БОТ: Проверяем, нужно ли ответить ===
+            $botResponse = null;
+            if (BOT_ENABLED && !empty(OPENROUTER_API_KEY)) {
+                $bot = new AIBot($this->redis, $this);
+                
+                if ($bot->shouldRespond($message)) {
+                    try {
+                        $botReply = $bot->generateResponse($message, $username);
+                        
+                        if (!empty($botReply)) {
+                            usleep(500000); // 0.5 секунды задержка
+                            
+                            $botMessage = $bot->sendBotMessage($botReply);
+                            $botResponse = $botMessage;
+                        }
+                    } catch (Exception $e) {
+                        error_log("Bot response error: " . $e->getMessage());
+                    }
+                }
+            }
             
             return [
                 'success' => true,
-                'message' => $savedMessage
+                'message' => $savedMessage,
+                'bot_message' => $botResponse
             ];
         }
         
         return ['success' => false, 'error' => 'Ошибка сохранения сообщения'];
     }
     
-    /**
-     * Получить IP клиента
-     */
     private function getClientIp() {
         $ip = '';
         
         if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-            // Cloudflare
             $ip = $_SERVER['HTTP_CF_CONNECTING_IP'];
         } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-            // Прокси
             $ip = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0];
         } elseif (!empty($_SERVER['HTTP_X_REAL_IP'])) {
-            // Nginx
             $ip = $_SERVER['HTTP_X_REAL_IP'];
         } else {
             $ip = $_SERVER['REMOTE_ADDR'] ?? '';
@@ -605,7 +714,6 @@ class ChatManager {
     public function getMessages($afterTimestamp = null) {
         $messages = $this->redis->getMessages(MAX_MESSAGES_DISPLAY, $afterTimestamp);
         
-        // Экранируем все данные для защиты от XSS
         foreach ($messages as &$msg) {
             $msg['username'] = $this->security->escape($msg['username']);
             $msg['message'] = $this->security->escape($msg['message']);
@@ -736,7 +844,7 @@ $stats = $chat->getStats();
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="<?php echo htmlspecialchars($csrfToken); ?>">
-    <title>💬 Гостевой Чат</title>
+    <title>💬 Гостевой Чат с AI</title>
     <style>
         * {
             margin: 0;
@@ -772,6 +880,7 @@ $stats = $chat->getStats();
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             padding: 20px;
+            position: relative;
         }
 
         .header-top {
@@ -807,6 +916,34 @@ $stats = $chat->getStats();
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
+        }
+
+        .sound-toggle {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+            z-index: 10;
+        }
+
+        .sound-toggle:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(1.1);
+        }
+
+        .sound-toggle.muted {
+            opacity: 0.5;
         }
 
         .chat-info {
@@ -851,6 +988,25 @@ $stats = $chat->getStats();
             text-align: center;
             color: #999;
             padding: 40px;
+        }
+
+        .bot-typing {
+            text-align: center;
+            padding: 10px;
+            color: #667eea;
+            font-size: 14px;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        .bot-typing::after {
+            content: '...';
+            animation: dots 1.5s steps(4, end) infinite;
+        }
+
+        @keyframes dots {
+            0%, 20% { content: '.'; }
+            40% { content: '..'; }
+            60%, 100% { content: '...'; }
         }
 
         .message {
@@ -994,7 +1150,6 @@ $stats = $chat->getStats();
             transform: none;
         }
 
-        /* Панель эмодзи */
         .emoji-picker {
             position: absolute;
             bottom: 160px;
@@ -1176,45 +1331,18 @@ $stats = $chat->getStats();
                 grid-template-columns: repeat(7, 1fr);
             }
         }
-		/* Кнопка звука */
-        .sound-toggle {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            background: rgba(255, 255, 255, 0.2);
-            border: none;
-            color: white;
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            cursor: pointer;
-            font-size: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.3s;
-            z-index: 10;
-        }
-
-        .sound-toggle:hover {
-            background: rgba(255, 255, 255, 0.3);
-            transform: scale(1.1);
-        }
-
-        .sound-toggle.muted {
-            opacity: 0.5;
-        }
     </style>
 </head>
 <body>
     <div class="chat-container">
         <div class="chat-header">
+            <button id="soundToggle" class="sound-toggle" title="Звук уведомлений">🔔</button>
+            
             <div class="header-top">
-                <h1>💬 Гостевой Чат</h1>
+                <h1>💬 Гостевой Чат с AI</h1>
                 <div class="online-indicator">
                     <span class="online-dot"></span>
                     <span id="onlineCount"><?php echo $stats['online']; ?></span> онлайн
-					<button id="soundToggle" class="sound-toggle" title="Звук уведомлений">🔔</button>
                 </div>
             </div>
             <div class="chat-info">
@@ -1227,6 +1355,11 @@ $stats = $chat->getStats();
                 <div class="info-item">
                     💾 RAM: <span id="memoryUsage"><?php echo $stats['memory_mb']; ?></span>MB
                 </div>
+                <?php if (BOT_ENABLED && !empty(OPENROUTER_API_KEY)): ?>
+                <div class="info-item">
+                    🤖 Бот активен (напишите <?php echo BOT_TRIGGER; ?>)
+                </div>
+                <?php endif; ?>
                 <div class="info-item">
                     🔒 XSS · CSRF · Rate Limit · IP Flood
                 </div>
@@ -1237,7 +1370,6 @@ $stats = $chat->getStats();
             <div class="loading">Загрузка сообщений...</div>
         </div>
         
-        <!-- Панель эмодзи -->
         <div class="emoji-picker" id="emojiPicker">
             <div class="emoji-picker-header">
                 <span class="emoji-picker-title">Выберите смайлик</span>
@@ -1269,7 +1401,7 @@ $stats = $chat->getStats();
             <div class="input-group">
                 <textarea 
                     id="messageInput" 
-                    placeholder="Напишите сообщение (макс <?php echo MAX_MESSAGE_LENGTH; ?> символов)..." 
+                    placeholder="Напишите сообщение... (для вызова бота: <?php echo BOT_TRIGGER; ?>)" 
                     maxlength="<?php echo MAX_MESSAGE_LENGTH; ?>"
                     rows="1"
                 ></textarea>
@@ -1296,16 +1428,16 @@ $stats = $chat->getStats();
         const DANGER_THRESHOLD = Math.floor(MAX_LENGTH * 0.95);
         const CHECK_INTERVAL = 7000;
         const STATS_UPDATE_INTERVAL = 15000;
+        const BOT_TRIGGER = '<?php echo BOT_TRIGGER; ?>';
 
-        // Коллекция эмодзи по категориям
         const EMOJI_DATA = {
             smileys: ['😀', '😃', '😄', '😁', '😆', '😅', '🤣', '😂', '🙂', '🙃', '😉', '😊', '😇', '🥰', '😍', '🤩', '😘', '😗', '😚', '😙', '😋', '😛', '😜', '🤪', '😝', '🤑', '🤗', '🤭', '🤫', '🤔', '🤐', '🤨', '😐', '😑', '😶', '😏', '😒', '🙄', '😬', '🤥', '😌', '😔', '😪', '🤤', '😴', '😷', '🤒', '🤕', '🤢', '🤮', '🤧', '🥵', '🥶', '😎', '🤓', '🧐', '😕', '😟', '🙁', '☹️', '😮', '😯', '😲', '😳', '🥺', '😦', '😧', '😨', '😰', '😥', '😢', '😭', '😱', '😖', '😣', '😞', '😓', '😩', '😫', '🥱', '😤', '😡', '😠', '🤬'],
-            gestures: ['👋', '🤚', '🖐️', '✋', '🖖', '👌', '🤏', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', '👉', '👆', '🖕', '👇', '☝️', '👍', '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '👐', '🤲', '🤝', '🙏', '✍️', '💅', '🤳', '💪', '🦾', '🦿', '🦵', '🦶', '👂', '🦻', '👃', '🧠', '🦷', '🦴', '👀', '👁️', '👅', '👄'],
-            animals: ['🐶', '🐱', '🐭', '🐹', '🐰', '🦊', '🐻', '🐼', '🐨', '🐯', '🦁', '🐮', '🐷', '🐽', '🐸', '🐵', '🙈', '🙉', '🙊', '🐒', '🐔', '🐧', '🐦', '🐤', '🐣', '🐥', '🦆', '🦅', '🦉', '🦇', '🐺', '🐗', '🐴', '🦄', '🐝', '🐛', '🦋', '🐌', '🐞', '🐜', '🦟', '🦗', '🕷️', '🦂', '🐢', '🐍', '🦎', '🦖', '🦕', '🐙', '🦑', '🦐', '🦞', '🦀', '🐡', '🐠', '🐟', '🐬', '🐳', '🐋', '🦈', '🐊', '🐅', '🐆', '🦓', '🦍', '🦧', '🐘', '🦛', '🦏', '🐪', '🐫', '🦒', '🦘', '🐃', '🐂', '🐄', '🐎', '🐖', '🐏', '🐑', '🦙', '🐐', '🦌', '🐕', '🐩', '🦮', '🐈', '🐓', '🦃', '🦚', '🦜', '🦢', '🦩', '🕊️', '🐇', '🦝', '🦨', '🦡', '🦦', '🦥', '🐁', '🐀', '🐿️', '🦔'],
-            food: ['🍎', '🍏', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇', '🍓', '🍈', '🍒', '🍑', '🥭', '🍍', '🥥', '🥝', '🍅', '🍆', '🥑', '🥦', '🥬', '🥒', '🌶️', '🌽', '🥕', '🧄', '🧅', '🥔', '🍠', '🥐', '🥯', '🍞', '🥖', '🥨', '🧀', '🥚', '🍳', '🧈', '🥞', '🧇', '🥓', '🥩', '🍗', '🍖', '🦴', '🌭', '🍔', '🍟', '🍕', '🥪', '🥙', '🧆', '🌮', '🌯', '🥗', '🥘', '🥫', '🍝', '🍜', '🍲', '🍛', '🍣', '🍱', '🥟', '🦪', '🍤', '🍙', '🍚', '🍘', '🍥', '🥠', '🥮', '🍢', '🍡', '🍧', '🍨', '🍦', '🥧', '🧁', '🍰', '🎂', '🍮', '🍭', '🍬', '🍫', '🍿', '🍩', '🍪', '🌰', '🥜', '🍯', '🥛', '🍼', '☕', '🍵', '🧃', '🥤', '🍶', '🍺', '🍻', '🥂', '🍷', '🥃', '🍸', '🍹', '🧉', '🍾', '🧊'],
-            activities: ['⚽', '🏀', '🏈', '⚾', '🥎', '🎾', '🏐', '🏉', '🥏', '🎱', '🪀', '🏓', '🏸', '🏒', '🏑', '🥍', '🏏', '🥅', '⛳', '🪁', '🏹', '🎣', '🤿', '🥊', '🥋', '🎽', '🛹', '🛷', '⛸️', '🥌', '🎿', '⛷️', '🏂', '🪂', '🏋️', '🤼', '🤸', '🤺', '⛹️', '🤾', '🏌️', '🏇', '🧘', '🏊', '🏄', '🚣', '🧗', '🚵', '🚴', '🏆', '🥇', '🥈', '🥉', '🏅', '🎖️', '🎗️', '🎫', '🎟️', '🎪', '🎭', '🎨', '🎬', '🎤', '🎧', '🎼', '🎹', '🥁', '🎷', '🎺', '🎸', '🪕', '🎻', '🎲', '♟️', '🎯', '🎳', '🎮', '🎰', '🧩'],
-            objects: ['⌚', '📱', '📲', '💻', '⌨️', '🖥️', '🖨️', '🖱️', '🖲️', '🕹️', '🗜️', '💾', '💿', '📀', '📼', '📷', '📸', '📹', '🎥', '📽️', '🎞️', '📞', '☎️', '📟', '📠', '📺', '📻', '🎙️', '🎚️', '🎛️', '🧭', '⏱️', '⏲️', '⏰', '🕰️', '⌛', '⏳', '📡', '🔋', '🔌', '💡', '🔦', '🕯️', '🪔', '🧯', '🛢️', '💸', '💵', '💴', '💶', '💷', '💰', '💳', '💎', '⚖️', '🧰', '🔧', '🔨', '⚒️', '🛠️', '⛏️', '🔩', '⚙️', '🧱', '⛓️', '🧲', '🔫', '💣', '🧨', '🪓', '🔪', '🗡️', '⚔️', '🛡️', '🚬', '⚰️', '⚱️', '🏺', '🔮', '📿', '🧿', '💈', '⚗️', '🔭', '🔬', '🕳️', '💊', '💉', '🩸', '🩹', '🩺', '🌡️', '🧬', '🦠', '🧫', '🧪', '🌋', '🗿', '🛎️', '🧳', '⌛', '⏳', '⌚', '⏰', '⏱️', '⏲️', '🕰️'],
-            symbols: ['❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '☮️', '✝️', '☪️', '🕉️', '☸️', '✡️', '🔯', '🕎', '☯️', '☦️', '🛐', '⛎', '♈', '♉', '♊', '♋', '♌', '♍', '♎', '♏', '♐', '♑', '♒', '♓', '🆔', '⚛️', '🉑', '☢️', '☣️', '📴', '📳', '🈶', '🈚', '🈸', '🈺', '🈷️', '✴️', '🆚', '💮', '🉐', '㊙️', '㊗️', '🈴', '🈵', '🈹', '🈲', '🅰️', '🅱️', '🆎', '🆑', '🅾️', '🆘', '❌', '⭕', '🛑', '⛔', '📛', '🚫', '💯', '💢', '♨️', '🚷', '🚯', '🚳', '🚱', '🔞', '📵', '🚭', '❗', '❕', '❓', '❔', '‼️', '⁉️', '🔅', '🔆', '〽️', '⚠️', '🚸', '🔱', '⚜️', '🔰', '♻️', '✅', '🈯', '💹', '❇️', '✳️', '❎', '🌐', '💠', 'Ⓜ️', '🌀', '💤', '🏧', '🚾', '♿', '🅿️', '🈳', '🈂️', '🛂', '🛃', '🛄', '🛅', '🚹', '🚺', '🚼', '🚻', '🚮', '🎦', '📶', '🈁', '🔣', 'ℹ️', '🔤', '🔡', '🔠', '🆖', '🆗', '🆙', '🆒', '🆕', '🆓', '0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟', '🔢', '#️⃣', '*️⃣', '⏏️', '▶️', '⏸️', '⏯️', '⏹️', '⏺️', '⏭️', '⏮️', '⏩', '⏪', '⏫', '⏬', '◀️', '🔼', '🔽', '➡️', '⬅️', '⬆️', '⬇️', '↗️', '↘️', '↙️', '↖️', '↕️', '↔️', '↪️', '↩️', '⤴️', '⤵️', '🔀', '🔁', '🔂', '🔄', '🔃', '🎵', '🎶', '➕', '➖', '➗', '✖️', '♾️', '💲', '💱', '™️', '©️', '®️', '〰️', '➰', '➿', '🔚', '🔙', '🔛', '🔝', '🔜', '✔️', '☑️', '🔘', '🔴', '🟠', '🟡', '🟢', '🔵', '🟣', '⚫', '⚪', '🟤', '🔺', '🔻', '🔸', '🔹', '🔶', '🔷', '🔳', '🔲', '▪️', '▫️', '◾', '◽', '◼️', '◻️', '🟥', '🟧', '🟨', '🟩', '🟦', '🟪', '⬛', '⬜', '🟫', '🔈', '🔇', '🔉', '🔊', '🔔', '🔕', '📣', '📢', '👁️‍🗨️', '💬', '💭', '🗯️', '♠️', '♣️', '♥️', '♦️', '🃏', '🎴', '🀄', '🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛', '🕜', '🕝', '🕞', '🕟', '🕠', '🕡', '🕢', '🕣', '🕤', '🕥', '🕦', '🕧']
+            gestures: ['👋', '🤚', '🖐️', '✋', '🖖', '👌', '🤏', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', '👉', '👆', '👇', '☝️', '👍', '👎', '✊', '👊', '🤛', '🤜', '👏', '🙌', '👐', '🤲', '🤝', '🙏'],
+            animals: ['🐶', '🐱', '🐭', '🐹', '🐰', '🦊', '🐻', '🐼', '🐨', '🐯', '🦁', '🐮', '🐷', '🐸', '🐵', '🐔', '🐧', '🐦', '🐤', '🦆', '🦅', '🦉', '🦇', '🐺', '🐗', '🐴', '🦄', '🐝', '🐛', '🦋', '🐌', '🐞', '🐜', '🦗', '🕷️', '🦂', '🐢', '🐍', '🦎', '🦖', '🦕', '🐙', '🦑', '🦐', '🦀', '🐡', '🐠', '🐟', '🐬', '🐳', '🐋', '🦈', '🐊', '🐅', '🐆', '🦓', '🦍', '🦧', '🐘', '🦛', '🦏', '🐪', '🐫', '🦒', '🦘', '🐃', '🐂', '🐄', '🐎', '🐖', '🐏', '🐑', '🦙', '🐐', '🦌', '🐕', '🐩', '🦮', '🐈', '🐓', '🦃', '🦚', '🦜', '🦢', '🦩', '🕊️', '🐇', '🦝', '🦨', '🦡', '🦦', '🦥'],
+            food: ['🍎', '🍏', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇', '🍓', '🍈', '🍒', '🍑', '🥭', '🍍', '🥥', '🥝', '🍅', '🍆', '🥑', '🥦', '🥬', '🥒', '🌶️', '🌽', '🥕', '🧄', '🧅', '🥔', '🍠', '🥐', '🥯', '🍞', '🥖', '🥨', '🧀', '🥚', '🍳', '🧈', '🥞', '🧇', '🥓', '🥩', '🍗', '🍖', '🌭', '🍔', '🍟', '🍕', '🥪', '🥙', '🧆', '🌮', '🌯', '🥗', '🥘', '🥫', '🍝', '🍜', '🍲', '🍛', '🍣', '🍱', '🥟', '🦪', '🍤', '🍙', '🍚', '🍘', '🍥', '🥠', '🥮', '🍢', '🍡', '🍧', '🍨', '🍦', '🥧', '🧁', '🍰', '🎂', '🍮', '🍭', '🍬', '🍫', '🍿', '🍩', '🍪', '🌰', '🥜', '🍯', '🥛', '🍼', '☕', '🍵', '🧃', '🥤', '🍶', '🍺', '🍻', '🥂', '🍷', '🥃', '🍸', '🍹', '🧉', '🍾'],
+            activities: ['⚽', '🏀', '🏈', '⚾', '🥎', '🎾', '🏐', '🏉', '🥏', '🎱', '🏓', '🏸', '🏒', '🏑', '🥍', '🏏', '🥅', '⛳', '🏹', '🎣', '🥊', '🥋', '🎽', '🛹', '🛷', '⛸️', '🥌', '🎿', '⛷️', '🏂', '🏋️', '🤼', '🤸', '🤺', '⛹️', '🤾', '🏌️', '🏇', '🧘', '🏊', '🏄', '🚣', '🧗', '🚵', '🚴', '🏆', '🥇', '🥈', '🥉', '🏅', '🎖️', '🎗️', '🎫', '🎟️', '🎪', '🎭', '🎨', '🎬', '🎤', '🎧', '🎼', '🎹', '🥁', '🎷', '🎺', '🎸', '🎻', '🎲', '🎯', '🎳', '🎮', '🎰'],
+            objects: ['⌚', '📱', '📲', '💻', '⌨️', '🖥️', '🖨️', '🖱️', '🖲️', '🕹️', '🗜️', '💾', '💿', '📀', '📼', '📷', '📸', '📹', '🎥', '📽️', '🎞️', '📞', '☎️', '📟', '📠', '📺', '📻', '🎙️', '🎚️', '🎛️', '🧭', '⏱️', '⏲️', '⏰', '🕰️', '⌛', '⏳', '📡', '🔋', '🔌', '💡', '🔦', '🕯️', '🧯', '🛢️', '💸', '💵', '💴', '💶', '💷', '💰', '💳', '💎', '⚖️', '🧰', '🔧', '🔨', '⚒️', '🛠️', '⛏️', '🔩', '⚙️', '🧱', '⛓️', '🧲', '🔫', '💣', '🧨', '🔪', '🗡️', '⚔️', '🛡️', '🚬', '⚰️', '⚱️', '🏺', '🔮', '📿', '🧿', '💈', '⚗️', '🔭', '🔬', '🕳️', '💊', '💉', '🩸', '🩹', '🩺', '🌡️', '🧬', '🦠', '🧫', '🧪'],
+            symbols: ['❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '☮️', '✝️', '☪️', '🕉️', '☸️', '✡️', '🔯', '🕎', '☯️', '☦️', '🛐', '⛎', '♈', '♉', '♊', '♋', '♌', '♍', '♎', '♏', '♐', '♑', '♒', '♓', '🆔', '⚛️', '☢️', '☣️', '📴', '📳', '🈶', '🈚', '🈸', '🈺', '🈷️', '✴️', '🆚', '💮', '🉐', '㊙️', '㊗️', '🈴', '🈵', '🈹', '🈲', '🅰️', '🅱️', '🆎', '🆑', '🅾️', '🆘', '❌', '⭕', '🛑', '⛔', '📛', '🚫', '💯', '💢', '♨️', '🚷', '🚯', '🚳', '🚱', '🔞', '📵', '🚭', '❗', '❕', '❓', '❔', '‼️', '⁉️', '🔅', '🔆', '〽️', '⚠️', '🚸', '🔱', '⚜️', '🔰', '♻️', '✅', '🈯', '💹', '❇️', '✳️', '❎', '🌐', '💠', '🌀', '💤', '🏧', '🚾', '♿', '🅿️', '🈳', '🈂️', '🛂', '🛃', '🛄', '🛅', '🚹', '🚺', '🚼', '🚻', '🚮', '🎦', '📶', '🈁', '🔣', 'ℹ️', '🔤', '🔡', '🔠', '🆖', '🆗', '🆙', '🆒', '🆕', '🆓']
         };
 
         class GuestChat {
@@ -1318,7 +1450,7 @@ $stats = $chat->getStats();
                 this.currentEmojiCategory = 'smileys';
                 this.soundEnabled = localStorage.getItem('chat_sound_enabled') !== 'false';
                 this.audioContext = null;
-                this.myLastMessageId = null; // ID последнего моего сообщения
+                this.myLastMessageId = null;
                 
                 this.initElements();
                 this.initAudio();
@@ -1370,7 +1502,6 @@ $stats = $chat->getStats();
                     oscillator.connect(gainNode);
                     gainNode.connect(this.audioContext.destination);
                     
-                    // Приятный звук уведомления
                     oscillator.frequency.setValueAtTime(800, this.audioContext.currentTime);
                     oscillator.frequency.setValueAtTime(600, this.audioContext.currentTime + 0.1);
                     
@@ -1389,7 +1520,6 @@ $stats = $chat->getStats();
                 localStorage.setItem('chat_sound_enabled', this.soundEnabled);
                 this.updateSoundButton();
                 
-                // Проиграть звук если включили
                 if (this.soundEnabled) {
                     this.playNotificationSound();
                 }
@@ -1426,14 +1556,10 @@ $stats = $chat->getStats();
                     localStorage.setItem('chat_username', this.usernameInput.value);
                 });
                 
-                // Эмодзи события
                 this.emojiButton.addEventListener('click', () => this.toggleEmojiPicker());
                 this.emojiClose.addEventListener('click', () => this.hideEmojiPicker());
-                
-                // Звук
                 this.soundToggle.addEventListener('click', () => this.toggleSound());
                 
-                // Закрытие эмодзи панели при клике вне её
                 document.addEventListener('click', (e) => {
                     if (!this.emojiPicker.contains(e.target) && e.target !== this.emojiButton) {
                         this.hideEmojiPicker();
@@ -1526,6 +1652,9 @@ $stats = $chat->getStats();
                 this.sendButton.disabled = true;
                 this.hideEmojiPicker();
                 
+                const triggerFound = message.toLowerCase().includes(BOT_TRIGGER.toLowerCase());
+                let typingIndicator = null;
+                
                 try {
                     const response = await fetch('?api=send', {
                         method: 'POST',
@@ -1542,12 +1671,25 @@ $stats = $chat->getStats();
                     const data = await response.json();
                     
                     if (data.success) {
-                        // Сохраняем ID своего сообщения
                         this.myLastMessageId = data.message.id;
                         
                         this.messageInput.value = '';
                         this.updateCharCount();
                         this.autoResize();
+                        
+                        if (triggerFound && data.bot_message) {
+                            typingIndicator = document.createElement('div');
+                            typingIndicator.className = 'bot-typing';
+                            typingIndicator.textContent = '🤖 Ассистент печатает';
+                            this.messagesContainer.appendChild(typingIndicator);
+                            this.scrollToBottom();
+                        }
+                        
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                        
+                        if (typingIndicator) {
+                            typingIndicator.remove();
+                        }
                         
                         await this.loadNewMessages();
                         this.updateStats();
@@ -1559,6 +1701,9 @@ $stats = $chat->getStats();
                         }
                     }
                 } catch (error) {
+                    if (typingIndicator) {
+                        typingIndicator.remove();
+                    }
                     this.showError('Ошибка соединения с сервером');
                     console.error('Error:', error);
                 } finally {
@@ -1596,12 +1741,10 @@ $stats = $chat->getStats();
                     if (data.success && data.messages.length > 0) {
                         this.lastMessageTimestamp = data.lastTimestamp || this.lastMessageTimestamp;
                         
-                        // Проверяем, есть ли новые сообщения не от нас
                         const hasNewFromOthers = data.messages.some(msg => msg.id !== this.myLastMessageId);
                         
                         this.appendMessages(data.messages);
                         
-                        // Играем звук только если есть чужие сообщения
                         if (hasNewFromOthers) {
                             this.playNotificationSound();
                         }
