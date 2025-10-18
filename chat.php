@@ -1176,6 +1176,34 @@ $stats = $chat->getStats();
                 grid-template-columns: repeat(7, 1fr);
             }
         }
+		/* Кнопка звука */
+        .sound-toggle {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+            z-index: 10;
+        }
+
+        .sound-toggle:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(1.1);
+        }
+
+        .sound-toggle.muted {
+            opacity: 0.5;
+        }
     </style>
 </head>
 <body>
@@ -1186,6 +1214,7 @@ $stats = $chat->getStats();
                 <div class="online-indicator">
                     <span class="online-dot"></span>
                     <span id="onlineCount"><?php echo $stats['online']; ?></span> онлайн
+					<button id="soundToggle" class="sound-toggle" title="Звук уведомлений">🔔</button>
                 </div>
             </div>
             <div class="chat-info">
@@ -1287,10 +1316,15 @@ $stats = $chat->getStats();
                 this.statsInterval = null;
                 this.isLoading = false;
                 this.currentEmojiCategory = 'smileys';
+                this.soundEnabled = localStorage.getItem('chat_sound_enabled') !== 'false';
+                this.audioContext = null;
+                this.myLastMessageId = null; // ID последнего моего сообщения
                 
                 this.initElements();
+                this.initAudio();
                 this.attachEvents();
                 this.initEmojiPicker();
+                this.updateSoundButton();
                 this.loadMessages();
                 this.updateStats();
                 this.startAutoCheck();
@@ -1315,6 +1349,62 @@ $stats = $chat->getStats();
                 this.emojiPicker = document.getElementById('emojiPicker');
                 this.emojiClose = document.getElementById('emojiClose');
                 this.emojiGrid = document.getElementById('emojiGrid');
+                this.soundToggle = document.getElementById('soundToggle');
+            }
+            
+            initAudio() {
+                try {
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                } catch (e) {
+                    console.warn('Web Audio API not supported');
+                }
+            }
+            
+            playNotificationSound() {
+                if (!this.soundEnabled || !this.audioContext) return;
+                
+                try {
+                    const oscillator = this.audioContext.createOscillator();
+                    const gainNode = this.audioContext.createGain();
+                    
+                    oscillator.connect(gainNode);
+                    gainNode.connect(this.audioContext.destination);
+                    
+                    // Приятный звук уведомления
+                    oscillator.frequency.setValueAtTime(800, this.audioContext.currentTime);
+                    oscillator.frequency.setValueAtTime(600, this.audioContext.currentTime + 0.1);
+                    
+                    gainNode.gain.setValueAtTime(0.3, this.audioContext.currentTime);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + 0.3);
+                    
+                    oscillator.start(this.audioContext.currentTime);
+                    oscillator.stop(this.audioContext.currentTime + 0.3);
+                } catch (e) {
+                    console.warn('Error playing sound:', e);
+                }
+            }
+            
+            toggleSound() {
+                this.soundEnabled = !this.soundEnabled;
+                localStorage.setItem('chat_sound_enabled', this.soundEnabled);
+                this.updateSoundButton();
+                
+                // Проиграть звук если включили
+                if (this.soundEnabled) {
+                    this.playNotificationSound();
+                }
+            }
+            
+            updateSoundButton() {
+                if (this.soundEnabled) {
+                    this.soundToggle.textContent = '🔔';
+                    this.soundToggle.classList.remove('muted');
+                    this.soundToggle.title = 'Звук включен (клик чтобы выключить)';
+                } else {
+                    this.soundToggle.textContent = '🔕';
+                    this.soundToggle.classList.add('muted');
+                    this.soundToggle.title = 'Звук выключен (клик чтобы включить)';
+                }
             }
             
             attachEvents() {
@@ -1340,6 +1430,9 @@ $stats = $chat->getStats();
                 this.emojiButton.addEventListener('click', () => this.toggleEmojiPicker());
                 this.emojiClose.addEventListener('click', () => this.hideEmojiPicker());
                 
+                // Звук
+                this.soundToggle.addEventListener('click', () => this.toggleSound());
+                
                 // Закрытие эмодзи панели при клике вне её
                 document.addEventListener('click', (e) => {
                     if (!this.emojiPicker.contains(e.target) && e.target !== this.emojiButton) {
@@ -1353,7 +1446,6 @@ $stats = $chat->getStats();
             }
             
             initEmojiPicker() {
-                // Инициализация категорий
                 const categories = document.querySelectorAll('.emoji-category');
                 categories.forEach(cat => {
                     cat.addEventListener('click', (e) => {
@@ -1364,7 +1456,6 @@ $stats = $chat->getStats();
                     });
                 });
                 
-                // Отрисовка эмодзи первой категории
                 this.renderEmojis();
             }
             
@@ -1400,8 +1491,6 @@ $stats = $chat->getStats();
                 this.messageInput.focus();
                 this.updateCharCount();
                 this.autoResize();
-                
-                // Не закрываем панель, чтобы можно было добавить несколько эмодзи
             }
             
             updateCharCount() {
@@ -1453,6 +1542,9 @@ $stats = $chat->getStats();
                     const data = await response.json();
                     
                     if (data.success) {
+                        // Сохраняем ID своего сообщения
+                        this.myLastMessageId = data.message.id;
+                        
                         this.messageInput.value = '';
                         this.updateCharCount();
                         this.autoResize();
@@ -1503,7 +1595,16 @@ $stats = $chat->getStats();
                     
                     if (data.success && data.messages.length > 0) {
                         this.lastMessageTimestamp = data.lastTimestamp || this.lastMessageTimestamp;
+                        
+                        // Проверяем, есть ли новые сообщения не от нас
+                        const hasNewFromOthers = data.messages.some(msg => msg.id !== this.myLastMessageId);
+                        
                         this.appendMessages(data.messages);
+                        
+                        // Играем звук только если есть чужие сообщения
+                        if (hasNewFromOthers) {
+                            this.playNotificationSound();
+                        }
                     }
                 } catch (error) {
                     console.error('Error loading new messages:', error);
@@ -1671,6 +1772,9 @@ $stats = $chat->getStats();
                 }
                 if (this.statsInterval) {
                     clearInterval(this.statsInterval);
+                }
+                if (this.audioContext) {
+                    this.audioContext.close();
                 }
             }
         }
