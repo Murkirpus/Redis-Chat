@@ -29,17 +29,32 @@ define('CLEANUP_INTERVAL', 3600);         // Интервал очистки (1 
 define('MAX_MESSAGES_TOTAL', 10000);      // Максимум сообщений в Redis
 define('MAX_MESSAGES_SOFT_LIMIT', 8000);  // Мягкий лимит (начало очистки)
 define('CLEANUP_BATCH_SIZE', 1000);       // Удалять по 1000 старых сообщений
-define('MAX_REDIS_MEMORY_MB', 100);       // Максимум памяти Redis (МБ)
+define('MAX_REDIS_MEMORY_MB', 10);       // Максимум памяти Redis (МБ)
 define('FLOOD_PROTECTION_WINDOW', 60);    // Окно антифлуда (секунд)
 define('MAX_MESSAGES_PER_IP', 10);        // Макс сообщений с одного IP в окне
 
 // === AI БОТ (OpenRouter) ===
 define('OPENROUTER_API_KEY', 'sk-or-v1-');         // Получите на https://openrouter.ai/keys
 define('BOT_ENABLED', true);              // Включить/выключить бота
-define('BOT_NAME', '🤖 Ассистент');      // Имя бота
-define('BOT_MODEL', 'qwen/qwen-2.5-72b-instruct:free'); // Бесплатная модель
+define('BOT_NAME', '🎬 КиноБот');        // Имя бота
+define('BOT_MODEL', 'google/gemini-2.0-flash-exp:free'); // Бесплатная модель https://openrouter.ai/models/?q=free
 define('BOT_TRIGGER', '@бот');           // Триггер для вызова бота
 define('BOT_MAX_HISTORY', 5);            // Сколько предыдущих сообщений учитывать
+
+// === КОНФИГУРАЦИЯ САЙТА С ФИЛЬМАМИ ===
+define('SITE_NAME', 'KINOPROSTOR');
+define('SITE_URL', 'https://kinoprostor.xyz');
+define('SITE_DESCRIPTION', 'Лучший сайт для просмотра фильмов и сериалов');
+define('SITE_FEATURES', [
+    'Более 10000 фильмов и сериалов',
+    'HD качество без рекламы',
+    'Новинки каждый день',
+    'Удобный поиск по жанрам',
+    'Рейтинги и отзывы',
+    'Подборки фильмов',
+    'История просмотров',
+    'Избранное и закладки'
+]);
 
 date_default_timezone_set('Europe/Moscow');
 
@@ -490,9 +505,28 @@ class AIBot {
         try {
             $context = $this->getRecentContext($isPrivateMode);
             
+            // Информация о сайте для промпта
+            $siteInfo = "Название сайта: " . SITE_NAME . "\n";
+            $siteInfo .= "URL: " . SITE_URL . "\n";
+            $siteInfo .= "Описание: " . SITE_DESCRIPTION . "\n";
+            $siteInfo .= "Возможности:\n" . implode("\n", array_map(function($f) { return "- " . $f; }, SITE_FEATURES));
+            
             $systemPrompt = $isPrivateMode 
-                ? "Ты дружелюбный AI помощник в приватном чате с пользователем. Твоё имя: " . BOT_NAME . ". Отвечай развернуто и детально, помогай решать задачи. Общайся на русском языке."
-                : "Ты дружелюбный помощник в публичном чате. Твоё имя: " . BOT_NAME . ". Отвечай кратко (1-2 предложения максимум). Используй смодзи. Общайся на русском языке. Будь веселым и позитивным!";
+                ? "Ты - " . BOT_NAME . ", официальный помощник сайта " . SITE_NAME . " (" . SITE_URL . ").\n\n" .
+                  "ВАЖНО: Ты можешь говорить ТОЛЬКО о нашем сайте с фильмами и его функциях. НЕ отвечай на вопросы, не связанные с кино, фильмами, сериалами или нашим сайтом.\n\n" .
+                  $siteInfo . "\n\n" .
+                  "Твои задачи:\n" .
+                  "1. Помогать пользователям найти фильмы и сериалы на нашем сайте\n" .
+                  "2. Рассказывать о функциях и возможностях сайта\n" .
+                  "3. Давать рекомендации по фильмам из нашей коллекции\n" .
+                  "4. Объяснять, как пользоваться сайтом\n" .
+                  "5. Рассказывать о новинках и популярных фильмах на сайте\n\n" .
+                  "Если пользователь спрашивает о чем-то, не связанном с фильмами или сайтом, вежливо напомни, что ты помогаешь только с вопросами о кино и нашем сайте.\n" .
+                  "Отвечай подробно и дружелюбно. Используй эмодзи 🎬🎥🍿📽️🎞️."
+                : "Ты - " . BOT_NAME . ", помощник сайта " . SITE_NAME . ".\n" .
+                  "ВАЖНО: Говори ТОЛЬКО о фильмах, сериалах и нашем сайте " . SITE_URL . "\n" .
+                  "На другие темы НЕ отвечай, вежливо напомни что помогаешь только с кино.\n" .
+                  "Отвечай КРАТКО (1-2 предложения). Используй эмодзи 🎬🍿.";
             
             $messages = [
                 [
@@ -877,7 +911,7 @@ $stats = $chat->getStats();
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="<?php echo htmlspecialchars($csrfToken); ?>">
-    <title>💬 Гостевой Чат с AI</title>
+    <title>🎬 КиноПортал - Чат поддержки</title>
     <style>
         * {
             margin: 0;
@@ -1452,7 +1486,7 @@ $stats = $chat->getStats();
             <button id="soundToggle" class="sound-toggle" title="Звук уведомлений">🔔</button>
             
             <div class="header-top">
-                <h1>💬 Гостевой Чат с AI</h1>
+                <h1>🎬 КиноЧат - Поддержка сайта</h1>
                 <div class="online-indicator">
                     <span class="online-dot"></span>
                     <span id="onlineCount"><?php echo $stats['online']; ?></span> онлайн
@@ -1466,8 +1500,8 @@ $stats = $chat->getStats();
                     <span>Общий чат</span>
                 </button>
                 <button class="mode-button" id="botModeBtn" data-mode="bot">
-                    <span class="mode-icon">🤖</span>
-                    <span>Чат с ботом</span>
+                    <span class="mode-icon">🎬</span>
+                    <span>Помощь по сайту</span>
                 </button>
             </div>
             
@@ -1482,20 +1516,20 @@ $stats = $chat->getStats();
                     💾 RAM: <span id="memoryUsage"><?php echo $stats['memory_mb']; ?></span>MB
                 </div>
                 <div class="info-item" id="botStatusInfo">
-                    🤖 Бот активен
+                    🎬 КиноБот активен
                 </div>
                 <div class="info-item">
-                    🔒 XSS · CSRF · Rate Limit · IP Flood
+                    🔒 Защищенный чат
                 </div>
             </div>
         </div>
         
         <div class="bot-mode-indicator" id="botModeIndicator">
-            🤖 Приватный режим: вы общаетесь с AI ассистентом
+            🎬 Приватный режим: консультация по сайту с фильмами
         </div>
         
         <div class="chat-messages" id="chatMessages">
-            <div class="loading">Загрузка сообщений...</div>
+            <div class="loading">Добро пожаловать в чат поддержки КиноПортала! 🎬</div>
         </div>
         
         <div class="emoji-picker" id="emojiPicker">
@@ -1683,16 +1717,16 @@ $stats = $chat->getStats();
                     this.botModeIndicator.classList.add('active');
                     this.messageInput.classList.add('bot-mode');
                     this.sendButton.classList.add('bot-mode');
-                    this.messageInput.placeholder = 'Напишите сообщение боту...';
-                    this.botStatusInfo.innerHTML = '🤖 Приватный чат с ботом';
+                    this.messageInput.placeholder = 'Задайте вопрос о фильмах или функциях сайта...';
+                    this.botStatusInfo.innerHTML = '🎬 Консультант по кино активен';
                 } else {
                     this.publicModeBtn.classList.add('active');
                     this.botModeBtn.classList.remove('active');
                     this.botModeIndicator.classList.remove('active');
                     this.messageInput.classList.remove('bot-mode');
                     this.sendButton.classList.remove('bot-mode');
-                    this.messageInput.placeholder = 'Напишите сообщение... (для вызова бота: ' + BOT_TRIGGER + ')';
-                    this.botStatusInfo.innerHTML = '🤖 Бот активен (напишите ' + BOT_TRIGGER + ')';
+                    this.messageInput.placeholder = 'Напишите сообщение... (для помощи по сайту: ' + BOT_TRIGGER + ')';
+                    this.botStatusInfo.innerHTML = '🎬 КиноБот активен (напишите ' + BOT_TRIGGER + ')';
                 }
                 
                 // Перезагружаем сообщения
@@ -1848,7 +1882,7 @@ $stats = $chat->getStats();
                         if (triggerFound && data.bot_message) {
                             typingIndicator = document.createElement('div');
                             typingIndicator.className = 'bot-typing';
-                            typingIndicator.textContent = '🤖 Ассистент печатает';
+                            typingIndicator.textContent = '🎬 КиноБот печатает';
                             this.messagesContainer.appendChild(typingIndicator);
                             this.scrollToBottom();
                         }
@@ -1956,7 +1990,7 @@ $stats = $chat->getStats();
             
             renderMessages(messages, shouldScroll = true) {
                 if (messages.length === 0) {
-                    this.messagesContainer.innerHTML = '<div class="loading">Пока нет сообщений. Будьте первым! 😊</div>';
+                    this.messagesContainer.innerHTML = '<div class="loading">Добро пожаловать! 🎬 Спросите о фильмах или функциях сайта.</div>';
                     return;
                 }
                 
